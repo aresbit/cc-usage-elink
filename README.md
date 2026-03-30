@@ -39,19 +39,27 @@ Display your **Claude Code usage** on a BLE tri-color e-ink screen — always vi
 
 ## Quick Start
 
-```bash
-# Clone
-git clone https://github.com/yourusername/cc-usage-elink
-cd cc-usage-elink
+`elink.py` is a single-file script — no installation needed, just [`uv`](https://docs.astral.sh/uv/).
 
-# First-time setup: scan & bind device, configure OAuth token
+```bash
+# Option A: run directly from URL (uv fetches dependencies automatically)
+uv run https://raw.githubusercontent.com/fuergaosi233/cc-usage-elink/main/elink.py setup
+
+# Option B: download the single file
+curl -O https://raw.githubusercontent.com/fuergaosi233/cc-usage-elink/main/elink.py
 uv run elink.py setup
 
-# Push usage to screen once
-uv run elink.py push
+# Option C: clone
+git clone https://github.com/fuergaosi233/cc-usage-elink && cd cc-usage-elink
+uv run elink.py setup
+```
 
-# Keep running in background, refresh every 30 minutes
-uv run elink.py watch
+After setup:
+
+```bash
+uv run elink.py push          # push usage to screen once
+uv run elink.py watch         # background mode, refresh every 30 min
+uv run elink.py watch -i 15   # refresh every 15 min
 ```
 
 ## Commands
