@@ -120,47 +120,53 @@ def image_to_eink_bytes(image_path: str) -> tuple[bytes, bytes]:
 
 # ── BLE ───────────────────────────────────────────────────────────────────────
 
-async def scan_devices(timeout: float = 8.0) -> list:
-    found = []
+def _is_eink_device(device, adv) -> bool:
+    """判断是否为蓝签墨水屏设备（严格匹配）"""
+    name  = (device.name or "").upper()
+    uuids = " ".join(str(u).lower() for u in (adv.service_uuids or []))
+    # 设备名含 EDP（蓝签固件特征）或广播完整 Service UUID
+    return "EDP" in name or SERVICE_UUID.lower() in uuids
+
+
+async def scan_devices(timeout: float = 8.0) -> list[tuple]:
+    """扫描蓝签设备，返回 (device, rssi) 列表，按 RSSI 降序（信号最强排最前）"""
+    seen: dict[str, tuple] = {}  # {address: (device, best_rssi)}
 
     def on_detect(device, adv):
-        name  = device.name or ""
-        uuids = [str(u).lower() for u in (adv.service_uuids or [])]
-        if (
-            "EDP" in name.upper()
-            or SERVICE_UUID.lower() in uuids
-            or "ffe0" in " ".join(uuids)
-        ) and device not in found:
-            found.append(device)
+        if not _is_eink_device(device, adv):
+            return
+        rssi = adv.rssi if adv.rssi is not None else -100
+        prev = seen.get(device.address)
+        if prev is None or rssi > prev[1]:
+            seen[device.address] = (device, rssi)
 
     async with BleakScanner(detection_callback=on_detect):
         await asyncio.sleep(timeout)
 
-    return found
+    return sorted(seen.values(), key=lambda x: -x[1])
 
 
 async def scan_until_found(timeout: float = 600.0) -> list:
-    """扫描直到发现至少一台蓝签设备（或超时），找到后再等3s收集其他设备"""
-    found = []
+    """扫描直到发现蓝签设备（或超时），找到后再等5s收集其他同类设备，按RSSI排序"""
+    seen: dict[str, tuple] = {}  # {address: (device, best_rssi)}
     ev    = asyncio.Event()
     start = time.monotonic()
 
     def on_detect(device, adv):
-        name  = device.name or ""
-        uuids = [str(u).lower() for u in (adv.service_uuids or [])]
-        if (
-            "EDP" in name.upper()
-            or SERVICE_UUID.lower() in uuids
-            or "ffe0" in " ".join(uuids)
-        ) and device not in found:
-            found.append(device)
+        if not _is_eink_device(device, adv):
+            return
+        rssi = adv.rssi if adv.rssi is not None else -100
+        prev = seen.get(device.address)
+        if prev is None or rssi > prev[1]:
+            seen[device.address] = (device, rssi)
+        if not ev.is_set():
             ev.set()
 
     async with BleakScanner(detection_callback=on_detect):
         live_task = asyncio.create_task(_scan_with_live(ev, start, timeout, None))
         try:
             await asyncio.wait_for(asyncio.shield(ev.wait()), timeout=timeout)
-            await asyncio.sleep(3.0)  # 多等3s收集附近其他设备
+            await asyncio.sleep(5.0)  # 多等5s，让同类设备都有机会广播
         except asyncio.TimeoutError:
             raise RuntimeError(f"扫描 {timeout:.0f}s 未发现设备，请确认设备已开机")
         finally:
@@ -170,7 +176,7 @@ async def scan_until_found(timeout: float = 600.0) -> list:
             except asyncio.CancelledError:
                 pass
 
-    return found
+    return sorted(seen.values(), key=lambda x: -x[1])
 
 
 async def _scan_with_live(ev: asyncio.Event, start: float, scan_timeout: float, address: str | None):
@@ -190,17 +196,17 @@ async def _scan_with_live(ev: asyncio.Event, start: float, scan_timeout: float, 
             await asyncio.sleep(0.25)
 
 
-async def _try_direct_connect(address: str, attempts: int = 3) -> BleakClient | None:
+async def _try_direct_connect(address: str, attempts: int = 8) -> BleakClient | None:
     """跳过扫描，直接按地址连接（CoreBluetooth 缓存过的设备有效）"""
     for i in range(attempts):
         client = BleakClient(address)
         try:
-            await client.connect(timeout=10.0)
+            await client.connect(timeout=30.0)
             return client
         except Exception as e:
             console.print(f"  [dim]直连尝试 {i+1}/{attempts}: {e}[/dim]")
             if i < attempts - 1:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
     return None
 
 
@@ -215,14 +221,21 @@ async def find_and_connect(address: str | None, scan_timeout: float = 60.0) -> B
         console.print("[yellow]直连失败，回退到扫描模式...[/yellow]")
 
     # ── 扫描模式（无地址 或 直连失败） ───────────────────────────────
-    found = None
+    # {address: (device, best_rssi)} — 持续更新，取最强信号
+    candidates: dict[str, tuple] = {}
     ev    = asyncio.Event()
 
     def on_detect(device, adv):
-        nonlocal found
-        uuids = " ".join(str(u).lower() for u in (adv.service_uuids or []))
-        if "ffe0" in uuids and (address is None or device.address == address) and not found:
-            found = device
+        # 严格匹配：有绑定地址时只接受精确匹配
+        if address is not None and device.address != address:
+            return
+        if not _is_eink_device(device, adv):
+            return
+        rssi = adv.rssi if adv.rssi is not None else -100
+        prev = candidates.get(device.address)
+        if prev is None or rssi > prev[1]:
+            candidates[device.address] = (device, rssi)
+        if not ev.is_set():
             ev.set()
 
     scanner = BleakScanner(detection_callback=on_detect)
@@ -231,7 +244,9 @@ async def find_and_connect(address: str | None, scan_timeout: float = 60.0) -> B
     start     = time.monotonic()
     live_task = asyncio.create_task(_scan_with_live(ev, start, scan_timeout, address))
     try:
-        await asyncio.wait_for(ev.wait(), timeout=scan_timeout)
+        await asyncio.wait_for(asyncio.shield(ev.wait()), timeout=scan_timeout)
+        # 多等3s让信号更新（取最强的）
+        await asyncio.sleep(3.0)
     except asyncio.TimeoutError:
         live_task.cancel()
         await scanner.stop()
@@ -243,22 +258,28 @@ async def find_and_connect(address: str | None, scan_timeout: float = 60.0) -> B
         except asyncio.CancelledError:
             pass
 
+    # 选信号最强的设备
+    found, best_rssi = max(candidates.values(), key=lambda x: x[1])
     elapsed = time.monotonic() - start
-    console.print(f"[green]✓[/green] 找到: [cyan]{found.name or '?'}[/cyan]  [dim]{elapsed:.1f}s[/dim]")
+    console.print(
+        f"[green]✓[/green] 找到: [cyan]{found.name or '?'}[/cyan]  "
+        f"[dim]RSSI={best_rssi}dBm  {elapsed:.1f}s[/dim]"
+    )
 
-    for attempt in range(5):
+    # 保持 scanner 运行 — CoreBluetooth 需要扫描器存活才能保住 peripheral 引用
+    for attempt in range(8):
         await asyncio.sleep(0.3)
         client = BleakClient(found)
         try:
-            await client.connect(timeout=20.0)
+            await client.connect(timeout=30.0)
             await scanner.stop()
             return client
         except Exception as e:
-            console.print(f"  [yellow]连接失败 (第{attempt+1}次): {e}，等2s重试...[/yellow]")
-            await asyncio.sleep(2.0)
+            console.print(f"  [yellow]连接失败 (第{attempt+1}次): {e}，等1s重试...[/yellow]")
+            await asyncio.sleep(1.0)
 
     await scanner.stop()
-    raise RuntimeError("连接失败，已重试5次")
+    raise RuntimeError("连接失败，已重试8次")
 
 
 async def send_channel(
@@ -394,111 +415,102 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
     sd   = (api or {}).get("seven_day")        or {}
     sd_s = (api or {}).get("seven_day_sonnet") or {}
 
-    # ── Canvas: render at ½ res, pixel-double with NEAREST ───────────
-    # 低分辨率渲染后 nearest-neighbor 放大，得到像素块风格（匹配墨水屏美学）
+    # ── Canvas ────────────────────────────────────────────────────────
     W, H  = 400, 300
-    rW, rH = W // 2, H // 2   # 200 × 150 canvas
-    P     = 7
-    BAR_H = 17
+    P     = 14
 
-    img = Image.new("RGB", (rW, rH), BG)
+    img = Image.new("RGB", (W, H), BG)
     d   = ImageDraw.Draw(img)
 
-    # ── Fonts (half apparent size; after 2× they look correct) ────────
-    def mono(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-        candidates = [
-            ("/System/Library/Fonts/Menlo.ttc",        1 if bold else 0),
-            ("/System/Library/Fonts/Monaco.ttf",        0),
-            ("/System/Library/Fonts/Courier.ttc",       1 if bold else 0),
-            ("/System/Library/Fonts/HelveticaNeue.ttc", 1 if bold else 0),
-        ]
-        for path, idx in candidates:
+    # SF Compact 笔画最粗，最适合黑白像素屏（覆盖率是 SF Mono 的 2x）
+    def F(size: int) -> ImageFont.FreeTypeFont:
+        for path in ["/System/Library/Fonts/SFCompact.ttf",
+                     "/System/Library/Fonts/Helvetica.ttc",
+                     "/System/Library/Fonts/SFNS.ttf",
+                     "/System/Library/Fonts/Arial.ttf"]:
             try:
-                return ImageFont.truetype(path, size, index=idx)
+                return ImageFont.truetype(path, size)
             except Exception:
                 pass
         return ImageFont.load_default()
 
+    def vcenter(font, row_y: int, row_h: int) -> int:
+        """返回使文字在 row_y..row_y+row_h 内垂直居中的绘制 y"""
+        bb = font.getbbox("Ag")
+        return row_y + (row_h - (bb[3] - bb[1])) // 2 - bb[1]
+
     # ── Header ────────────────────────────────────────────────────────
-    HDR_H = 29
-    d.rectangle([0, 0, rW, HDR_H], fill=BLACK)
-    d.text((P, HDR_H // 2), "CC  USAGE",
-           font=mono(17, bold=True), fill=WHITE, anchor="lm")
-    d.text((rW - P, HDR_H // 2 - 5),
-           datetime.now().strftime("%H:%M"),
-           font=mono(9), fill=(175, 175, 175), anchor="rm")
-    d.text((rW - P, HDR_H // 2 + 5),
-           date.today().strftime("%-d %b"),
-           font=mono(7), fill=(150, 150, 150), anchor="rm")
+    HDR_H = 38
+    d.rectangle([0, 0, W, HDR_H], fill=BLACK)
+    tf = F(22)
+    d.text((P, vcenter(tf, 0, HDR_H)), "CC USAGE", font=tf, fill=WHITE)
+    sf = F(14)
+    right_str = datetime.now().strftime("%H:%M") + "  " + date.today().strftime("%-d %b").upper()
+    d.text((W - P, vcenter(sf, 0, HDR_H)), right_str, font=sf, fill=(190, 190, 190), anchor="rt")
 
-    # ── Helpers ───────────────────────────────────────────────────────
-    def dashed(y: int, x1: int, x2: int):
-        x = x1
-        while x < x2:
-            d.line([x, y, min(x + 2, x2), y], fill=GRAY, width=1)
-            x += 4
+    # ── 3 sections 无缝铺满剩余高度 ──────────────────────────────────
+    # 1px 分割线 × 2 + 3 section 等高 = 300 - 38 = 262px
+    SEP_H   = 1
+    SEC_H   = (H - HDR_H - 2 * SEP_H) // 3   # 86px
+    LABEL_H = 28                               # 标签行高
+    BAR_H   = SEC_H - LABEL_H                 # 58px 进度条
 
-    def row_header(y: int, label: str, reset_str: str) -> int:
-        lf = mono(8, bold=True)
-        rf = mono(7)
-        lw = int(d.textlength(label, font=lf))
-        rw = int(d.textlength(reset_str, font=rf))
-        d.text((P, y), label, font=lf, fill=BLACK)
-        dashed(y + 5, P + lw + 3, rW - P - rw - 3)
-        d.text((rW - P, y), reset_str, font=rf, fill=GRAY, anchor="rt")
-        return y + 12
+    # 右侧百分比最宽为 "100%" ≈ 52px @ 20px font
+    pf     = F(20)
+    PCW    = int(pf.getlength("100%")) + 6
+    BLW    = int(F(20).getlength("7D")) + 8   # 左侧 "5H"/"7D" 标签
 
-    def bar_row(y: int, label: str, pct: float, pct_str: str,
-                fill_color=BLACK) -> int:
-        LW = 18
-        PW = 26
-        bx = P + LW + 3
-        bw = rW - P - LW - PW - 6
+    def section(y0: int, label: str, reset_str: str,
+                bar_label: str, pct: float, pct_str: str,
+                fill_color=BLACK):
+        # 标签行
+        lf  = F(20)
+        rf  = F(14)
+        d.text((P, vcenter(lf, y0, LABEL_H)),          label,     font=lf, fill=BLACK)
+        d.text((W - P, vcenter(rf, y0, LABEL_H)), reset_str, font=rf, fill=GRAY, anchor="rt")
 
-        d.text((P, y + (BAR_H - 10) // 2),
-               label, font=mono(10, bold=True), fill=BLACK)
+        # 进度条行
+        by  = y0 + LABEL_H
+        bx  = P + BLW + 4
+        bw  = W - P - BLW - PCW - 8
 
-        d.rectangle([bx, y, bx + bw, y + BAR_H],
-                    outline=BLACK, width=1, fill=LGRAY)
+        blf = F(20)
+        d.text((P, vcenter(blf, by, BAR_H)), bar_label, font=blf, fill=BLACK)
+
+        d.rectangle([bx, by + 2, bx + bw, by + BAR_H - 2], outline=BLACK, width=1, fill=LGRAY)
         if pct > 0.001:
             fw = max(int(pct * (bw - 2)), 1)
-            d.rectangle([bx + 1, y + 1, bx + fw, y + BAR_H - 1],
-                        fill=fill_color)
+            d.rectangle([bx + 1, by + 3, bx + fw, by + BAR_H - 3], fill=fill_color)
 
-        d.text((rW - P, y + (BAR_H - 10) // 2),
-               pct_str, font=mono(10, bold=True), fill=fill_color, anchor="rt")
+        ppf = F(20)
+        d.text((W - P, vcenter(ppf, by, BAR_H)), pct_str, font=ppf, fill=fill_color, anchor="rt")
 
-        return y + BAR_H + 4
-
-    # ── Sections ──────────────────────────────────────────────────────
-    y = HDR_H + 5
-
+    # ── 渲染 3 个 section + 分割线 ────────────────────────────────────
     fh_pct = (fh.get("utilization") or 0) / 100
     fh_col = RED if fh_pct >= 0.8 else BLACK
     fh_str = f"{fh.get('utilization', 0):.0f}%" if fh else "—"
     fh_rst = _fmt_resets(fh.get("resets_at")) if fh else "No data"
 
-    y = row_header(y, "SESSION", f"Resets {fh_rst}")
-    y = bar_row(y, "5H", fh_pct, fh_str, fh_col)
-    y += 5
-
     sd_pct = (sd.get("utilization") or 0) / 100
     sd_str = f"{sd.get('utilization', 0):.0f}%" if sd else "—"
     sd_rst = _fmt_resets(sd.get("resets_at")) if sd else "—"
-
-    y = row_header(y, "ALL MODELS", f"Resets {sd_rst}")
-    y = bar_row(y, "7D", sd_pct, sd_str)
-    y += 5
 
     ss_pct = (sd_s.get("utilization") or 0) / 100
     ss_str = f"{sd_s.get('utilization', 0):.0f}%" if sd_s else "—"
     ss_rst = _fmt_resets(sd_s.get("resets_at")) if sd_s else "—"
 
-    y = row_header(y, "SONNET", f"Resets {ss_rst}")
-    bar_row(y, "7D", ss_pct, ss_str)
+    sections = [
+        ("SESSION",    f"Resets {fh_rst}", "5H", fh_pct, fh_str, fh_col),
+        ("ALL MODELS", f"Resets {sd_rst}", "7D", sd_pct, sd_str, BLACK),
+        ("SONNET",     f"Resets {ss_rst}", "7D", ss_pct, ss_str, BLACK),
+    ]
+    for i, args in enumerate(sections):
+        y0 = HDR_H + i * (SEC_H + SEP_H)
+        section(y0, *args)
+        if i < 2:
+            sep_y = y0 + SEC_H
+            d.line([P, sep_y, W - P, sep_y], fill=LGRAY, width=SEP_H)
 
-    # ── Pixel-double to 400×300 (nearest-neighbor = hard pixel edges) ─
-    img = img.resize((W, H), Image.NEAREST)
     img.save(out)
     return out
 
@@ -539,16 +551,17 @@ def setup(force: bool):
             table.add_column("#", style="dim", width=3)
             table.add_column("设备名", min_width=20)
             table.add_column("地址", style="cyan")
-            for i, dev in enumerate(devices, 1):
-                table.add_row(str(i), dev.name or "—", dev.address)
+            table.add_column("RSSI", style="yellow", justify="right")
+            for i, (dev, rssi) in enumerate(devices, 1):
+                table.add_row(str(i), dev.name or "—", dev.address, f"{rssi} dBm")
             console.print(table)
 
             if len(devices) == 1:
-                selected = devices[0]
+                selected, _ = devices[0]
                 console.print(f"自动选择唯一设备: [cyan]{selected.name or selected.address}[/cyan]")
             else:
-                idx      = click.prompt("选择设备编号", type=click.IntRange(1, len(devices)))
-                selected = devices[idx - 1]
+                idx         = click.prompt("选择设备编号", type=click.IntRange(1, len(devices)))
+                selected, _ = devices[idx - 1]
 
             cfg["device_address"] = selected.address
             save_config(cfg)
@@ -615,8 +628,9 @@ def scan(timeout: float):
     table.add_column("#", style="dim", width=3)
     table.add_column("设备名", min_width=20)
     table.add_column("地址", style="cyan")
-    for i, dev in enumerate(devices, 1):
-        table.add_row(str(i), dev.name or "—", dev.address)
+    table.add_column("RSSI", style="yellow", justify="right")
+    for i, (dev, rssi) in enumerate(devices, 1):
+        table.add_row(str(i), dev.name or "—", dev.address, f"{rssi} dBm")
     console.print(table)
 
 
@@ -645,17 +659,19 @@ def bind(address: str | None, timeout: float):
     table.add_column("#", style="dim", width=3)
     table.add_column("设备名", min_width=20)
     table.add_column("地址", style="cyan")
-    for i, dev in enumerate(devices, 1):
-        table.add_row(str(i), dev.name or "—", dev.address)
+    table.add_column("RSSI", style="yellow", justify="right")
+    for i, (dev, rssi) in enumerate(devices, 1):
+        table.add_row(str(i), dev.name or "—", dev.address, f"{rssi} dBm")
     console.print(table)
 
     if len(devices) == 1:
-        if not click.confirm(f"绑定 [{devices[0].name or devices[0].address}]?", default=True):
+        dev0, _ = devices[0]
+        if not click.confirm(f"绑定 [{dev0.name or dev0.address}]?", default=True):
             return
-        selected = devices[0]
+        selected = dev0
     else:
-        idx      = click.prompt("选择设备编号", type=click.IntRange(1, len(devices)))
-        selected = devices[idx - 1]
+        idx         = click.prompt("选择设备编号", type=click.IntRange(1, len(devices)))
+        selected, _ = devices[idx - 1]
 
     cfg = load_config()
     cfg["device_address"] = selected.address
