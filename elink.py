@@ -380,8 +380,8 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
     BG    = (252, 252, 250)
     BLACK = (8,   8,   8)
     WHITE = (255, 255, 255)
-    GRAY  = (120, 120, 120)
-    LGRAY = (218, 218, 218)  # bar track (renders as white on e-ink, keeps outline)
+    GRAY  = (115, 115, 115)
+    LGRAY = (215, 215, 215)
     RED   = (190, 30,  30)
 
     # ── Data ──────────────────────────────────────────────────────────
@@ -394,18 +394,22 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
     sd   = (api or {}).get("seven_day")        or {}
     sd_s = (api or {}).get("seven_day_sonnet") or {}
 
-    # ── Canvas ────────────────────────────────────────────────────────
-    W, H, P = 400, 300, 14
-    BAR_H   = 30
-    img = Image.new("RGB", (W, H), BG)
+    # ── Canvas: render at ½ res, pixel-double with NEAREST ───────────
+    # 低分辨率渲染后 nearest-neighbor 放大，得到像素块风格（匹配墨水屏美学）
+    W, H  = 400, 300
+    rW, rH = W // 2, H // 2   # 200 × 150 canvas
+    P     = 7
+    BAR_H = 17
+
+    img = Image.new("RGB", (rW, rH), BG)
     d   = ImageDraw.Draw(img)
 
-    # ── Fonts (monospace: Menlo → Monaco → fallback) ──────────────────
+    # ── Fonts (half apparent size; after 2× they look correct) ────────
     def mono(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
         candidates = [
-            ("/System/Library/Fonts/Menlo.ttc",    1 if bold else 0),
-            ("/System/Library/Fonts/Monaco.ttf",   0),
-            ("/System/Library/Fonts/Courier.ttc",  1 if bold else 0),
+            ("/System/Library/Fonts/Menlo.ttc",        1 if bold else 0),
+            ("/System/Library/Fonts/Monaco.ttf",        0),
+            ("/System/Library/Fonts/Courier.ttc",       1 if bold else 0),
             ("/System/Library/Fonts/HelveticaNeue.ttc", 1 if bold else 0),
         ]
         for path, idx in candidates:
@@ -415,66 +419,60 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
                 pass
         return ImageFont.load_default()
 
-    # ── Header block ──────────────────────────────────────────────────
-    HDR_H = 54
-    d.rectangle([0, 0, W, HDR_H], fill=BLACK)
+    # ── Header ────────────────────────────────────────────────────────
+    HDR_H = 29
+    d.rectangle([0, 0, rW, HDR_H], fill=BLACK)
     d.text((P, HDR_H // 2), "CC  USAGE",
-           font=mono(26, bold=True), fill=WHITE, anchor="lm")
-    d.text((W - P, HDR_H // 2 - 7),
+           font=mono(17, bold=True), fill=WHITE, anchor="lm")
+    d.text((rW - P, HDR_H // 2 - 5),
            datetime.now().strftime("%H:%M"),
-           font=mono(14), fill=(175, 175, 175), anchor="rm")
-    d.text((W - P, HDR_H // 2 + 8),
+           font=mono(9), fill=(175, 175, 175), anchor="rm")
+    d.text((rW - P, HDR_H // 2 + 5),
            date.today().strftime("%-d %b"),
-           font=mono(11), fill=(140, 140, 140), anchor="rm")
+           font=mono(7), fill=(150, 150, 150), anchor="rm")
 
     # ── Helpers ───────────────────────────────────────────────────────
     def dashed(y: int, x1: int, x2: int):
         x = x1
         while x < x2:
-            d.line([x, y, min(x + 4, x2), y], fill=GRAY, width=1)
-            x += 7
+            d.line([x, y, min(x + 2, x2), y], fill=GRAY, width=1)
+            x += 4
 
     def row_header(y: int, label: str, reset_str: str) -> int:
-        lf = mono(11, bold=True)
-        rf = mono(11)
+        lf = mono(8, bold=True)
+        rf = mono(7)
         lw = int(d.textlength(label, font=lf))
         rw = int(d.textlength(reset_str, font=rf))
         d.text((P, y), label, font=lf, fill=BLACK)
-        dashed(y + 7, P + lw + 6, W - P - rw - 6)
-        d.text((W - P, y), reset_str, font=rf, fill=GRAY, anchor="rt")
-        return y + 20
+        dashed(y + 5, P + lw + 3, rW - P - rw - 3)
+        d.text((rW - P, y), reset_str, font=rf, fill=GRAY, anchor="rt")
+        return y + 12
 
     def bar_row(y: int, label: str, pct: float, pct_str: str,
                 fill_color=BLACK) -> int:
-        LW = 30   # label column
-        PW = 48   # percent column
-        bx = P + LW + 6
-        bw = W - P - LW - PW - 12
+        LW = 18
+        PW = 26
+        bx = P + LW + 3
+        bw = rW - P - LW - PW - 6
 
-        # row label (5H / 7D)
-        d.text((P, y + (BAR_H - 15) // 2),
-               label, font=mono(14, bold=True), fill=BLACK)
+        d.text((P, y + (BAR_H - 10) // 2),
+               label, font=mono(10, bold=True), fill=BLACK)
 
-        # bar track: outline only (interior = LGRAY → white on e-ink)
         d.rectangle([bx, y, bx + bw, y + BAR_H],
                     outline=BLACK, width=1, fill=LGRAY)
-
-        # fill
         if pct > 0.001:
-            fw = max(int(pct * (bw - 2)), 2)
+            fw = max(int(pct * (bw - 2)), 1)
             d.rectangle([bx + 1, y + 1, bx + fw, y + BAR_H - 1],
                         fill=fill_color)
 
-        # percentage
-        d.text((W - P, y + (BAR_H - 15) // 2),
-               pct_str, font=mono(14, bold=True), fill=fill_color, anchor="rt")
+        d.text((rW - P, y + (BAR_H - 10) // 2),
+               pct_str, font=mono(10, bold=True), fill=fill_color, anchor="rt")
 
-        return y + BAR_H + 8
+        return y + BAR_H + 4
 
     # ── Sections ──────────────────────────────────────────────────────
-    y = HDR_H + 10
+    y = HDR_H + 5
 
-    # SESSION (5-hour)
     fh_pct = (fh.get("utilization") or 0) / 100
     fh_col = RED if fh_pct >= 0.8 else BLACK
     fh_str = f"{fh.get('utilization', 0):.0f}%" if fh else "—"
@@ -482,25 +480,25 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
 
     y = row_header(y, "SESSION", f"Resets {fh_rst}")
     y = bar_row(y, "5H", fh_pct, fh_str, fh_col)
-    y += 10
+    y += 5
 
-    # WEEKLY — All models
     sd_pct = (sd.get("utilization") or 0) / 100
     sd_str = f"{sd.get('utilization', 0):.0f}%" if sd else "—"
     sd_rst = _fmt_resets(sd.get("resets_at")) if sd else "—"
 
     y = row_header(y, "ALL MODELS", f"Resets {sd_rst}")
     y = bar_row(y, "7D", sd_pct, sd_str)
-    y += 10
+    y += 5
 
-    # WEEKLY — Sonnet
     ss_pct = (sd_s.get("utilization") or 0) / 100
     ss_str = f"{sd_s.get('utilization', 0):.0f}%" if sd_s else "—"
     ss_rst = _fmt_resets(sd_s.get("resets_at")) if sd_s else "—"
 
     y = row_header(y, "SONNET", f"Resets {ss_rst}")
-    y = bar_row(y, "7D", ss_pct, ss_str)
+    bar_row(y, "7D", ss_pct, ss_str)
 
+    # ── Pixel-double to 400×300 (nearest-neighbor = hard pixel edges) ─
+    img = img.resize((W, H), Image.NEAREST)
     img.save(out)
     return out
 
