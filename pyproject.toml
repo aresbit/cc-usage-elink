@@ -1,0 +1,11 @@
+[project]
+name = "cc-usage-elink"
+version = "0.1.0"
+description = "Claude Code usage dashboard on a BLE tri-color e-ink display"
+requires-python = ">=3.13"
+dependencies = [
+    "bleak>=0.22,<1.0",
+    "pillow>=12.1.1",
+    "click>=8.1",
+    "rich>=13.0",
+]
