@@ -9,7 +9,7 @@
 # ]
 # ///
 """
-蓝签墨水屏 BLE 交互工具 + Claude Code 用量看板
+蓝签墨水屏 BLE 交互工具 + Kimi Code 用量看板
 设备: 4.2寸(400x300) 三色墨水屏 (黑/白/红)
 """
 
@@ -343,23 +343,78 @@ def _est_seconds(total_packets: int) -> float:
 # ── Usage image ───────────────────────────────────────────────────────────────
 
 def _detect_token_from_keychain() -> str | None:
-    """尝试从 macOS Keychain 自动读取 OAuth Token"""
-    raw = subprocess.run(
-        ["security", "find-generic-password", "-s", "usage-elink-oauth", "-w"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    if raw:
-        return raw
+    """尝试从系统密钥库自动读取 Kimi Token（macOS Keychain / Linux secret-tool）"""
+    import sys
 
-    raw = subprocess.run(
-        ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    if raw:
+    # macOS: security 命令
+    if sys.platform == "darwin":
         try:
-            return json.loads(raw)["claudeAiOauth"]["accessToken"]
-        except Exception:
+            # 优先查找 Kimi token
+            raw = subprocess.run(
+                ["security", "find-generic-password", "-s", "elink-kimi-token", "-w"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if raw:
+                return raw
+        except FileNotFoundError:
             pass
+
+    # Linux: secret-tool (libsecret)
+    elif sys.platform.startswith("linux"):
+        try:
+            raw = subprocess.run(
+                ["secret-tool", "lookup", "service", "elink-kimi"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if raw:
+                return raw
+        except FileNotFoundError:
+            pass
+
+    return None
+
+
+def _get_token_from_cdp() -> str | None:
+    """通过 Chrome CDP 从已登录的 Kimi 页面获取 token"""
+    cdp_script = Path.home() / ".claude" / "skills" / "chrome-cdp" / "scripts" / "cdp.mjs"
+    if not cdp_script.exists():
+        return None
+
+    try:
+        # 1. 列出所有页面，找 kimi.com/code/console
+        result = subprocess.run(
+            ["node", str(cdp_script), "list"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return None
+
+        # 解析找到 kimi 页面
+        target = None
+        for line in result.stdout.splitlines():
+            if "kimi.com/code/console" in line.lower():
+                # 提取 target ID (第一列)
+                parts = line.split()
+                if parts:
+                    target = parts[0]
+                    break
+
+        if not target:
+            return None
+
+        # 2. 从页面 localStorage 获取 access_token
+        result = subprocess.run(
+            ["node", str(cdp_script), "eval", target, "localStorage.getItem('access_token')"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            token = result.stdout.strip().strip('"')
+            if token and token.startswith("eyJ"):
+                return token
+
+    except Exception:
+        pass
+
     return None
 
 
@@ -368,21 +423,138 @@ def get_oauth_token() -> str | None:
     return load_config().get("oauth_token") or _detect_token_from_keychain()
 
 
+def _prompt_manual_token(cfg: dict):
+    """提示用户手动输入 Token"""
+    import sys
+    if sys.platform == "darwin":
+        store_hint = "[dim]安全存储: security add-generic-password -s elink-kimi-token -a elink -w <token>[/dim]"
+    elif sys.platform.startswith("linux"):
+        store_hint = "[dim]安全存储: secret-tool store --label='elink-kimi' service elink-kimi[/dim]"
+    else:
+        store_hint = ""
+    console.print(
+        "[dim]获取方式: 浏览器访问 https://www.kimi.com/code/console[/dim]\n"
+        "[dim]DevTools → Application → Local Storage → kimi.com → access_token[/dim]\n"
+        + store_hint
+    )
+    token = click.prompt("粘贴 Kimi Token", hide_input=True)
+    cfg["oauth_token"] = token
+    save_config(cfg)
+    console.print("[green]✓[/green] Token 已保存")
+
+
 def fetch_usage(token: str) -> dict | None:
+    """获取 Kimi Code 用量数据（通过 CDP 从页面文本解析）"""
+    # 优先使用 CDP 从浏览器页面获取
+    cdp_data = _get_usage_from_page()
+    if cdp_data:
+        return cdp_data
+
+    # 回退：直接 API 请求（可能会 401）
     try:
         req = urllib.request.Request(
-            "https://api.anthropic.com/api/oauth/usage",
+            "https://api.kimi.com/coding/v1/usages",
             headers={
                 "Authorization": f"Bearer {token}",
-                "anthropic-beta": "oauth-2025-04-20",
             },
         )
         with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read())
+            data = json.loads(r.read())
+            return data.get("usage", {})
     except Exception as e:
         console.print(f"[yellow]API 请求失败: {e}[/yellow]")
         return None
 
+
+
+
+
+def _get_usage_from_page() -> dict | None:
+    """通过 Chrome CDP 从页面文本解析用量数据"""
+    cdp_script = Path.home() / ".claude" / "skills" / "chrome-cdp" / "scripts" / "cdp.mjs"
+    if not cdp_script.exists():
+        return None
+
+    try:
+        # 1. 找到 kimi 页面
+        result = subprocess.run(
+            ["node", str(cdp_script), "list"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return None
+
+        target = None
+        for line in result.stdout.splitlines():
+            if "kimi.com/code/console" in line.lower():
+                parts = line.split()
+                if parts:
+                    target = parts[0]
+                    break
+
+        if not target:
+            return None
+
+        # 2. 获取页面文本
+        result = subprocess.run(
+            ["node", str(cdp_script), "eval", target, "document.body.innerText"],
+            capture_output=True, text=True, timeout=15
+        )
+
+        if result.returncode != 0:
+            return None
+
+        text = result.stdout
+
+        # 3. 解析用量数据
+        import re
+        from datetime import datetime, timedelta, timezone
+
+        usage_data = {}
+
+        # 查找所有百分比和重置时间
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            # Weekly usage 行 - 查找附近5行内的百分比
+            if 'Weekly usage' in line or '每周用量' in line:
+                for j in range(i, min(i + 5, len(lines))):
+                    pct_match = re.search(r'(\d+)%', lines[j])
+                    if pct_match and 'weekly_pct' not in usage_data:
+                        usage_data['weekly_pct'] = int(pct_match.group(1))
+                    reset_match = re.search(r'Resets in (\d+) hours', lines[j], re.IGNORECASE)
+                    if reset_match:
+                        hours = int(reset_match.group(1))
+                        reset_time = datetime.now(timezone.utc) + timedelta(hours=hours)
+                        usage_data['weekly_reset'] = reset_time.isoformat()
+
+            # Rate limit 行
+            if 'Rate limit' in line or '利率限制' in line:
+                for j in range(i, min(i + 5, len(lines))):
+                    pct_match = re.search(r'(\d+)%', lines[j])
+                    if pct_match and 'rate_pct' not in usage_data:
+                        usage_data['rate_pct'] = int(pct_match.group(1))
+                    reset_match = re.search(r'Resets in (\d+) minutes', lines[j], re.IGNORECASE)
+                    if reset_match:
+                        mins = int(reset_match.group(1))
+                        reset_time = datetime.now(timezone.utc) + timedelta(minutes=mins)
+                        usage_data['rate_reset'] = reset_time.isoformat()
+
+        # 构建返回数据
+        if 'weekly_pct' in usage_data:
+            return {
+                'limit': '100',
+                'used': str(usage_data['weekly_pct']),
+                'remaining': str(100 - usage_data['weekly_pct']),
+                'resetTime': usage_data.get('weekly_reset', ''),
+                'rate_used': str(usage_data.get('rate_pct', 0)),
+                'rate_remaining': str(100 - usage_data.get('rate_pct', 0)),
+                'rate_reset': usage_data.get('rate_reset', ''),
+            }
+
+    except Exception as e:
+        console.print(f"[dim]CDP获取失败: {e}[/dim]")
+
+    return None
 
 def _fmt_resets(iso: str | None) -> str:
     if not iso:
@@ -409,11 +581,24 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
     token = get_oauth_token()
     api   = fetch_usage(token) if token else None
     if not token:
-        console.print("[yellow]未找到 OAuth Token（用 elink setup 配置）[/yellow]")
+        console.print("[yellow]未找到 Token（用 elink setup 配置）[/yellow]")
 
-    fh   = (api or {}).get("five_hour")       or {}
-    sd   = (api or {}).get("seven_day")        or {}
-    sd_s = (api or {}).get("seven_day_sonnet") or {}
+    # Kimi Code API: { "limit": "100", "used": "33", "remaining": "67", "resetTime": "..." }
+    usage = api or {}
+
+    # 计算使用率百分比
+    def _calc_pct(u: dict) -> float:
+        limit = float(u.get("limit", 0) or 0)
+        used = float(u.get("used", 0) or 0)
+        return (used / limit) if limit > 0 else 0
+
+    def _get_pct_str(u: dict) -> str:
+        pct = _calc_pct(u) * 100
+        return f"{pct:.0f}%" if u else "—"
+
+    def _get_reset_str(u: dict) -> str:
+        rt = u.get("resetTime")
+        return _fmt_resets(rt) if rt else "—"
 
     # ── Canvas ────────────────────────────────────────────────────────
     W, H  = 400, 300
@@ -422,12 +607,63 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
     img = Image.new("RGB", (W, H), BG)
     d   = ImageDraw.Draw(img)
 
-    # SF Compact 笔画最粗，最适合黑白像素屏（覆盖率是 SF Mono 的 2x）
+    # 跨平台字体选择：优先使用系统默认粗体无衬线字体
+    def _get_font_paths() -> list[str]:
+        import sys
+        paths = []
+        if sys.platform == "darwin":
+            paths = [
+                "/System/Library/Fonts/SFCompact.ttf",
+                "/System/Library/Fonts/Helvetica.ttc",
+                "/System/Library/Fonts/SFNS.ttf",
+                "/System/Library/Fonts/Arial.ttf",
+            ]
+        elif sys.platform == "win32":
+            paths = [
+                "C:/Windows/Fonts/segoeuib.ttf",
+                "C:/Windows/Fonts/arialbd.ttf",
+                "C:/Windows/Fonts/calibrib.ttf",
+                "C:/Windows/Fonts/arial.ttf",
+            ]
+        else:  # Linux / Unix
+            # 通过 fc-list 动态获取已安装字体（如果可用）
+            try:
+                result = subprocess.run(
+                    ["fc-list", ":family", "-f", "%{file}\n"],
+                    capture_output=True, text=True, timeout=2
+                )
+                if result.returncode == 0:
+                    candidates = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+                    # 优先常见的粗体/清晰字体
+                    priority = ["DejaVuSans-Bold", "LiberationSans-Bold", "FreeSans-Bold",
+                                "NotoSans-Bold", "Ubuntu-Bold", "DejaVuSans",
+                                "LiberationSans", "FreeSans", "NotoSans"]
+                    for p in priority:
+                        for c in candidates:
+                            if p.lower().replace("-bold", "") in c.lower() and p.replace("-Bold", "").lower() in c.lower():
+                                if "bold" in c.lower() or "Bold" in c:
+                                    paths.append(c)
+                                    break
+                        if not paths:
+                            for c in candidates:
+                                if p.replace("-Bold", "").lower() in c.lower():
+                                    paths.append(c)
+                                    break
+            except Exception:
+                pass
+            # 回退到常见路径
+            paths += [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/freefont/FreeSans-Bold.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            ]
+        return paths
+
     def F(size: int) -> ImageFont.FreeTypeFont:
-        for path in ["/System/Library/Fonts/SFCompact.ttf",
-                     "/System/Library/Fonts/Helvetica.ttc",
-                     "/System/Library/Fonts/SFNS.ttf",
-                     "/System/Library/Fonts/Arial.ttf"]:
+        for path in _get_font_paths():
             try:
                 return ImageFont.truetype(path, size)
             except Exception:
@@ -443,7 +679,7 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
     HDR_H = 38
     d.rectangle([0, 0, W, HDR_H], fill=BLACK)
     tf = F(22)
-    d.text((P, vcenter(tf, 0, HDR_H)), "CC USAGE", font=tf, fill=WHITE)
+    d.text((P, vcenter(tf, 0, HDR_H)), "KIMI CODE", font=tf, fill=WHITE)
     sf = F(14)
     right_str = datetime.now().strftime("%H:%M") + "  " + date.today().strftime("%-d %b").upper()
     d.text((W - P, vcenter(sf, 0, HDR_H)), right_str, font=sf, fill=(190, 190, 190), anchor="rt")
@@ -455,10 +691,11 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
     LABEL_H = 28                               # 标签行高
     BAR_H   = SEC_H - LABEL_H                 # 58px 进度条
 
-    # 右侧百分比最宽为 "100%" ≈ 52px @ 20px font
+    # 右侧百分比最宽为 "100%"，留足够空间
     pf     = F(20)
-    PCW    = int(pf.getlength("100%")) + 6
-    BLW    = int(F(20).getlength("7D")) + 8   # 左侧 "5H"/"7D" 标签
+    PCW    = int(pf.getlength("100%")) + 12  # 增加右边距
+    # 左侧标签宽度：适应最长的标签 "TOTAL"
+    BLW    = int(F(20).getlength("TOTAL")) + 4  # 减小左边距
 
     def section(y0: int, label: str, reset_str: str,
                 bar_label: str, pct: float, pct_str: str,
@@ -485,24 +722,28 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
         ppf = F(20)
         d.text((W - P, vcenter(ppf, by, BAR_H)), pct_str, font=ppf, fill=fill_color, anchor="rt")
 
-    # ── 渲染 3 个 section + 分割线 ────────────────────────────────────
-    fh_pct = (fh.get("utilization") or 0) / 100
-    fh_col = RED if fh_pct >= 0.8 else BLACK
-    fh_str = f"{fh.get('utilization', 0):.0f}%" if fh else "—"
-    fh_rst = _fmt_resets(fh.get("resets_at")) if fh else "No data"
+    # ── 渲染 section + 分割线 ────────────────────────────────────
+    # Kimi Code: 显示 Weekly usage 和 Rate limit
+    usage_pct = _calc_pct(usage)
+    usage_col = RED if usage_pct >= 0.8 else BLACK
+    usage_str = _get_pct_str(usage)
+    usage_rst = _get_reset_str(usage)
 
-    sd_pct = (sd.get("utilization") or 0) / 100
-    sd_str = f"{sd.get('utilization', 0):.0f}%" if sd else "—"
-    sd_rst = _fmt_resets(sd.get("resets_at")) if sd else "—"
+    # Rate limit 数据
+    rate_used = usage.get("rate_used", "0")
+    rate_pct = int(rate_used) / 100 if rate_used.isdigit() else 0
+    rate_col = RED if rate_pct >= 0.8 else BLACK
+    rate_str = f"{rate_used}%" if rate_used.isdigit() else "—"
+    rate_rst = _fmt_resets(usage.get("rate_reset"))
 
-    ss_pct = (sd_s.get("utilization") or 0) / 100
-    ss_str = f"{sd_s.get('utilization', 0):.0f}%" if sd_s else "—"
-    ss_rst = _fmt_resets(sd_s.get("resets_at")) if sd_s else "—"
+    # 获取剩余额度显示
+    remaining = usage.get("remaining", "—")
+    limit = usage.get("limit", "—")
 
     sections = [
-        ("SESSION",    f"Resets {fh_rst}", "5H", fh_pct, fh_str, fh_col),
-        ("ALL MODELS", f"Resets {sd_rst}", "7D", sd_pct, sd_str, BLACK),
-        ("SONNET",     f"Resets {ss_rst}", "7D", ss_pct, ss_str, BLACK),
+        ("WEEKLY", f"Resets {usage_rst}", "7D", usage_pct, usage_str, usage_col),
+        ("RATE LIMIT", f"Resets {rate_rst}", "5H", rate_pct, rate_str, rate_col),
+        ("REMAINING", f"Limit {limit}", "LEFT", usage_pct, str(remaining), usage_col),
     ]
     for i, args in enumerate(sections):
         y0 = HDR_H + i * (SEC_H + SEP_H)
@@ -519,7 +760,7 @@ def render_usage_image(out: str = "/tmp/usage_display.png") -> str:
 
 @click.group()
 def cli():
-    """蓝签墨水屏 CLI · Claude Code 用量看板"""
+    """蓝签墨水屏 CLI · Kimi Code 用量看板"""
 
 
 # ─ setup ─────────────────────────────────────────────────────────────────────
@@ -569,36 +810,41 @@ def setup(force: bool):
 
     # ── 步骤 2: OAuth Token ───────────────────────────────────────────
     if cfg.get("oauth_token") and not force:
-        console.print(f"[dim]✓ OAuth Token 已配置（用 --force 重新配置）[/dim]")
+        console.print(f"[dim]✓ Token 已配置: {cfg['oauth_token'][:16]}…（用 --force 重新配置）[/dim]")
     else:
-        console.print("\n[bold]步骤 2/2[/bold]  配置 OAuth Token")
-        with console.status("[bold]检测 Keychain...[/bold]"):
-            auto_token = _detect_token_from_keychain()
+        console.print("\n[bold]步骤 2/2[/bold]  配置 Kimi Token")
 
-        need_manual = True
+        token_source = None
+        auto_token = None
+
+        # 优先级1: 尝试 CDP 自动获取（Chrome 已登录）
+        with console.status("[bold]尝试从 Chrome 获取 Token...[/bold]"):
+            cdp_token = _get_token_from_cdp()
+        if cdp_token:
+            auto_token = cdp_token
+            token_source = "Chrome"
+
+        # 优先级2: Keychain
+        if not auto_token:
+            with console.status("[bold]检测 Keychain...[/bold]"):
+                keychain_token = _detect_token_from_keychain()
+            if keychain_token:
+                auto_token = keychain_token
+                token_source = "Keychain"
+
+        # 处理自动获取到的 token
         if auto_token:
-            console.print(
-                f"[green]✓[/green] 从 Keychain 读取到 Token: [dim]{auto_token[:16]}…[/dim]"
-            )
+            console.print(f"[green]✓[/green] 从 {token_source} 读取到 Token: [dim]{auto_token[:16]}…[/dim]")
             if click.confirm("使用此 Token?", default=True):
                 cfg["oauth_token"] = auto_token
                 save_config(cfg)
-                console.print("[green]✓[/green] Token 已保存")
-                need_manual = False
+                console.print(f"[green]✓[/green] Token 已从 {token_source} 保存到配置文件")
             else:
-                console.print("[dim]已跳过，请手动输入[/dim]")
+                _prompt_manual_token(cfg)
         else:
-            console.print("[yellow]Keychain 中未找到 Token[/yellow]")
-
-        if need_manual:
-            console.print(
-                "[dim]获取方式: Claude.ai DevTools → Application → Cookies → sessionKey[/dim]\n"
-                "[dim]或: macOS Keychain → 搜索 usage-elink-oauth[/dim]"
-            )
-            token = click.prompt("粘贴 OAuth Token", hide_input=True)
-            cfg["oauth_token"] = token
-            save_config(cfg)
-            console.print("[green]✓[/green] Token 已保存")
+            console.print("[yellow]未从 Chrome 或 Keychain 找到 Token[/yellow]")
+            console.print("[dim]提示: 确保 Chrome 已开启远程调试并登录 kimi.com/code/console[/dim]")
+            _prompt_manual_token(cfg)
 
     # ── 完成 ─────────────────────────────────────────────────────────
     console.print(Panel(
@@ -726,7 +972,7 @@ def push(address: str | None, out: str, dry_run: bool):
     if not address:
         address = load_config().get("device_address")
 
-    with console.status("[bold]获取 Claude Code 用量数据...[/bold]"):
+    with console.status("[bold]获取 Kimi Code 用量数据...[/bold]"):
         image_path = render_usage_image(out)
     console.print(f"[green]✓[/green] 用量图已生成: {image_path}")
 
@@ -806,7 +1052,7 @@ def config():
 
 
 @config.command("set-token")
-@click.option("--token", prompt="OAuth Token", hide_input=True, help="Claude OAuth Token")
+@click.option("--token", prompt="Kimi Token", hide_input=True, help="Kimi Code Token")
 def config_set_token(token: str):
     """设置 OAuth Token"""
     cfg = load_config()

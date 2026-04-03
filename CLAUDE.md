@@ -1,10 +1,10 @@
 # usage-elink
 
-蓝签墨水屏 BLE 交互工具 + Claude Code 用量看板
+蓝签墨水屏 BLE 交互工具 + Kimi Code 用量看板
 
 ## 项目概述
 
-通过蓝牙BLE向4.2寸三色墨水屏（黑/白/红，400×300px）发送图片。主要用途：在墨水屏上实时显示 Claude Code 用量数据。
+通过蓝牙BLE向4.2寸三色墨水屏（黑/白/红，400×300px）发送图片。主要用途：在墨水屏上实时显示 Kimi Code 用量数据。
 
 ## 硬件
 
@@ -51,8 +51,9 @@ rich>=13.0
 ## 主要文件
 
 - `elink.py` — 唯一入口：BLE通讯 + 图像转换 + 用量数据拉取 + CLI
-- `~/.config/elink/config.json` — 设备地址 + OAuth Token 持久化配置
+- `~/.config/elink/config.json` — 设备地址 + Token 持久化配置
 - `/tmp/usage_display.png` — 生成的看板图片（临时）
+- `get_kimi_token_cdp.sh` — CDP 自动获取 Token 脚本（可选）
 
 ## CLI 用法
 
@@ -88,63 +89,60 @@ uv run elink.py config clear-token
 
 | 数据 | 来源 |
 |------|------|
-| 5-hour session 使用率 | `https://api.anthropic.com/api/oauth/usage` |
-| 7-day weekly 使用率（All models / Sonnet only） | 同上 |
+| Quota Usage | `https://api.kimi.com/coding/v1/usages` |
+| 剩余额度 | 同上 |
 
-### OAuth Token 获取与配置
+### Token 获取与配置
 
-**优先级**: config 文件 > Keychain `usage-elink-oauth` > Keychain `Claude Code-credentials`
-
-#### 所需 OAuth 权限
-
-获取用量数据需要 Token 包含以下 scope：
-- `user:profile`
-- `user:inference`
+**优先级**: config 文件 > Keychain `elink-kimi-token` > Linux secret-tool
 
 #### 获取方式
 
+**方式1：CDP 自动获取（推荐，Chrome 需开启远程调试）**
+
 ```bash
-# 方式1：自动配置（推荐，首次运行）
-uv run elink.py setup
-
-# 方式2：手动设置
-uv run elink.py config set-token   # 隐藏输入粘贴 Token
-
-# 方式3：存入 Keychain（自动读取，无需 set-token）
-security add-generic-password -s "usage-elink-oauth" -a "elink" -w "<token>"
+# 1. Chrome 开启远程调试: 访问 chrome://inspect/#remote-debugging 并启用
+# 2. 确保已登录 https://www.kimi.com/code/console
+./get_kimi_token_cdp.sh
 ```
 
-**通过 Claude Code OAuth 流程获取含 usage 权限的 Token（推荐）：**
+**方式2：手动获取**
 
-1. 运行 `claude setup-token`，终端会输出 OAuth 授权 URL（不要直接访问）
-2. 复制该 URL，找到 `scope=` 参数，原始值通常只有基础权限
-3. 将 `scope` 参数值修改为 `user%3Ainference%20user%3Aprofile`（即 `user:inference user:profile`）
-   - 示例：`...&scope=user%3Ainference%20user%3Aprofile&...`
-4. 用修改后的完整 URL 在浏览器中访问并完成授权
-5. 授权完成后 Claude Code 自动接收 Token，即包含 usage 查询权限
+1. 浏览器访问 https://www.kimi.com/code/console
+2. 登录账号
+3. DevTools → Application → Local Storage → `kimi.com` → `access_token`
+4. 复制 token 值
 
-手动获取 Token：Claude.ai DevTools → Application → Cookies → `sessionKey`
+**方式3：手动配置**
 
-多账号：切换账号时重新运行 `elink setup` 或 `elink config set-token`。
+```bash
+uv run elink.py config set-token   # 隐藏输入粘贴 Token
+```
 
-### 看板布局（当前）
+**方式4：存入系统密钥库（自动读取）**
+
+```bash
+# macOS
+security add-generic-password -s "elink-kimi-token" -a "elink" -w "<token>"
+
+# Linux (需要 libsecret 和 secret-tool)
+secret-tool store --label='elink-kimi' service elink-kimi
+# 然后输入 token
+```
+
+### 看板布局
 
 ```
 ┌─────────────────────────────────────┐
-│ Plan Usage Limits          30 Mar   │  ← 黑色 header
+│ KIMI CODE                  14:32    │  ← 黑色 header
 ├─────────────────────────────────────┤
-│ Current session           81% used  │
+│ QUOTA USAGE               33% used  │
 │ Resets in 3h 29m                    │
-│ [████████████░░░]                   │  ← 5-hour bar（蓝色，≥80% 变红）
+│ [████████████░░░░░░░░░░░░░░░░░░░░]  │  ← 使用率进度条（≥80% 变红）
 ├─────────────────────────────────────┤
-│ Weekly limits                       │
-│ All models                — % used  │
-│ Resets Wed 8:00 PM                  │
-│ [░░░░░░░░░░░░░░░]                   │
-├─────────────────────────────────────┤
-│ Sonnet only               — % used  │
-│ Resets Wed 8:00 PM                  │
-│ [░░░░░░░░░░░░░░░]                   │
+│ REMAINING                 67        │
+│ Limit 100                           │
+│ [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  │
 └─────────────────────────────────────┘
 ```
 
