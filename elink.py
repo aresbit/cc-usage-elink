@@ -331,7 +331,11 @@ async def _do_send(address: str | None, black_bytes: bytes, red_bytes: bytes):
 
         console.print(Panel("[bold green]发送完毕，墨水屏正在刷新！[/bold green]", expand=False))
     finally:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception as e:
+            # 断开时的 EOFError 等设备异常不影响成功结果
+            console.print(f"[dim]断开连接: {e}[/dim]")
 
 
 def _est_seconds(total_packets: int) -> float:
@@ -495,6 +499,7 @@ def _get_usage_from_page() -> dict | None:
         if not target:
             return None
 
+
         # 2. 获取页面文本
         result = subprocess.run(
             ["node", str(cdp_script), "eval", target, "document.body.innerText"],
@@ -512,12 +517,15 @@ def _get_usage_from_page() -> dict | None:
 
         usage_data = {}
 
-        # 查找所有百分比和重置时间
-        lines = text.split('\n')
+        # 清理文本：将 Unicode 空白替换为普通空格
+        clean_text = text.replace('\xa0', ' ').replace('\u2002', ' ')
+        lines = clean_text.split('\n')
+
+
         for i, line in enumerate(lines):
-            # Weekly usage 行 - 查找附近5行内的百分比
+            # Weekly usage 行 - 查找附近6行内的百分比
             if 'Weekly usage' in line or '每周用量' in line:
-                for j in range(i, min(i + 5, len(lines))):
+                for j in range(i, min(i + 6, len(lines))):
                     pct_match = re.search(r'(\d+)%', lines[j])
                     if pct_match and 'weekly_pct' not in usage_data:
                         usage_data['weekly_pct'] = int(pct_match.group(1))
@@ -529,7 +537,7 @@ def _get_usage_from_page() -> dict | None:
 
             # Rate limit 行
             if 'Rate limit' in line or '利率限制' in line:
-                for j in range(i, min(i + 5, len(lines))):
+                for j in range(i, min(i + 6, len(lines))):
                     pct_match = re.search(r'(\d+)%', lines[j])
                     if pct_match and 'rate_pct' not in usage_data:
                         usage_data['rate_pct'] = int(pct_match.group(1))
@@ -541,7 +549,7 @@ def _get_usage_from_page() -> dict | None:
 
         # 构建返回数据
         if 'weekly_pct' in usage_data:
-            return {
+            result_data = {
                 'limit': '100',
                 'used': str(usage_data['weekly_pct']),
                 'remaining': str(100 - usage_data['weekly_pct']),
@@ -550,9 +558,14 @@ def _get_usage_from_page() -> dict | None:
                 'rate_remaining': str(100 - usage_data.get('rate_pct', 0)),
                 'rate_reset': usage_data.get('rate_reset', ''),
             }
+            return result_data
+        else:
+            console.print("[yellow]未找到 weekly_pct 数据[/yellow]")
 
     except Exception as e:
-        console.print(f"[dim]CDP获取失败: {e}[/dim]")
+        import traceback
+        console.print(f"[yellow]CDP获取失败: {e}[/yellow]")
+        console.print(f"[dim]{traceback.format_exc()}[/dim]")
 
     return None
 
@@ -988,6 +1001,44 @@ def push(address: str | None, out: str, dry_run: bool):
 
 # ─ watch ─────────────────────────────────────────────────────────────────────
 
+async def _watch_loop(address: str, interval: int, out: str):
+    """watch 的异步循环实现"""
+    run_count = 0
+    while True:
+        run_count += 1
+        console.rule(f"[bold]第 {run_count} 次  {datetime.now().strftime('%H:%M:%S')}[/bold]")
+
+        try:
+            with console.status("[bold]获取用量数据...[/bold]"):
+                image_path = render_usage_image(out)
+            console.print(f"[green]✓[/green] 用量图已生成")
+
+            with console.status("[bold]转换图片...[/bold]"):
+                black_bytes, red_bytes = image_to_eink_bytes(image_path)
+
+            await _do_send(address, black_bytes, red_bytes)
+
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            import traceback
+            console.print(f"[red]推送失败: {e}[/red]")
+            console.print(f"[dim]{traceback.format_exc()}[/dim]")
+            console.print(f"[yellow]将在 {interval} 分钟后重试[/yellow]")
+
+        # ── 倒计时 ────────────────────────────────────────────────────
+        seconds = interval * 60
+        try:
+            with Live(console=console, refresh_per_second=2) as live:
+                for remaining in range(seconds, 0, -1):
+                    m, s = divmod(remaining, 60)
+                    live.update(Text(f"  下次推送: {m:02d}:{s:02d}", style="dim"))
+                    await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]已停止[/yellow]")
+            break
+
+
 @cli.command()
 @click.argument("address", required=False)
 @click.option("--interval", "-i", default=5, show_default=True, help="刷新间隔（分钟）")
@@ -1011,37 +1062,7 @@ def watch(address: str | None, interval: int, out: str):
         expand=False,
     ))
 
-    run_count = 0
-    while True:
-        run_count += 1
-        console.rule(f"[bold]第 {run_count} 次  {datetime.now().strftime('%H:%M:%S')}[/bold]")
-
-        try:
-            with console.status("[bold]获取用量数据...[/bold]"):
-                image_path = render_usage_image(out)
-            console.print(f"[green]✓[/green] 用量图已生成")
-
-            with console.status("[bold]转换图片...[/bold]"):
-                black_bytes, red_bytes = image_to_eink_bytes(image_path)
-
-            asyncio.run(_do_send(address, black_bytes, red_bytes))
-
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            console.print(f"[red]推送失败: {e}[/red]  将在 {interval} 分钟后重试")
-
-        # ── 倒计时 ────────────────────────────────────────────────────
-        seconds = interval * 60
-        try:
-            with Live(console=console, refresh_per_second=2) as live:
-                for remaining in range(seconds, 0, -1):
-                    m, s = divmod(remaining, 60)
-                    live.update(Text(f"  下次推送: {m:02d}:{s:02d}", style="dim"))
-                    time.sleep(1)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]已停止[/yellow]")
-            break
+    asyncio.run(_watch_loop(address, interval, out))
 
 
 # ─ config ────────────────────────────────────────────────────────────────────
