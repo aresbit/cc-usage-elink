@@ -65,15 +65,13 @@ echo "Token: ${TOKEN:0:20}..."
 echo ""
 
 # 保存到配置
-echo "是否保存到 elink 配置? (y/n)"
-read -r CONFIRM
-if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
-    CONFIG_PATH="$HOME/.config/elink/config.json"
-    mkdir -p "$(dirname "$CONFIG_PATH")"
+echo "自动保存到 elink 配置..."
+CONFIG_PATH="$HOME/.config/elink/config.json"
+mkdir -p "$(dirname "$CONFIG_PATH")"
 
-    if [ -f "$CONFIG_PATH" ]; then
-        # 更新现有配置
-        python3 -c "
+if [ -f "$CONFIG_PATH" ]; then
+    # 更新现有配置
+    python3 -c "
 import json
 import sys
 with open('$CONFIG_PATH', 'r') as f:
@@ -83,17 +81,16 @@ with open('$CONFIG_PATH', 'w') as f:
     json.dump(cfg, f, indent=2)
 print('配置已更新')
 "
-    else
-        # 创建新配置
-        echo "{\"oauth_token\": \"$TOKEN\"}" > "$CONFIG_PATH"
-        echo "配置已创建"
-    fi
-
-    echo ""
-    echo "✓ Token 已保存到 $CONFIG_PATH"
-    echo ""
-    echo "现在可以运行: uv run elink.py push"
+else
+    # 创建新配置
+    echo "{\"oauth_token\": \"$TOKEN\"}" > "$CONFIG_PATH"
+    echo "配置已创建"
 fi
+
+echo ""
+echo "✓ Token 已保存到 $CONFIG_PATH"
+echo ""
+echo "现在可以运行: uv run elink.py push"
 
 echo ""
 echo "完整 Token (用于手动配置):"

@@ -388,7 +388,7 @@ def _get_token_from_cdp() -> str | None:
         # 1. 列出所有页面，找 kimi.com/code/console
         result = subprocess.run(
             ["node", str(cdp_script), "list"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
             return None
@@ -473,17 +473,34 @@ def fetch_usage(token: str) -> dict | None:
 
 
 
-def _get_usage_from_page() -> dict | None:
-    """通过 Chrome CDP 从页面文本解析用量数据"""
+def _find_kimi_target() -> str | None:
+    """查找或返回缓存的 Kimi 页面 target ID（供 CDP 函数使用）"""
     cdp_script = Path.home() / ".claude" / "skills" / "chrome-cdp" / "scripts" / "cdp.mjs"
     if not cdp_script.exists():
         return None
 
+    cfg = load_config()
+    cached = cfg.get("kimi_target_id")
+
+    # 如果缓存存在，先尝试使用它
+    if cached:
+        try:
+            # 测试缓存 target 是否仍然有效
+            result = subprocess.run(
+                ["node", str(cdp_script), "eval", cached, "1+1"],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0:
+                return cached
+        except Exception:
+            # 缓存无效，继续扫描
+            pass
+
+    # 扫描查找 Kimi 页面
     try:
-        # 1. 找到 kimi 页面
         result = subprocess.run(
             ["node", str(cdp_script), "list"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
             return None
@@ -496,14 +513,43 @@ def _get_usage_from_page() -> dict | None:
                     target = parts[0]
                     break
 
+        if target:
+            # 保存到缓存
+            cfg["kimi_target_id"] = target
+            save_config(cfg)
+        return target
+    except Exception:
+        return None
+
+
+def _get_usage_from_page() -> dict | None:
+    """通过 Chrome CDP 从页面文本解析用量数据"""
+    cdp_script = Path.home() / ".claude" / "skills" / "chrome-cdp" / "scripts" / "cdp.mjs"
+    if not cdp_script.exists():
+        return None
+
+    try:
+        # 1. 找到 kimi 页面
+        target = _find_kimi_target()
         if not target:
             return None
 
+        # 2. 先刷新页面获取最新数据
+        refresh_result = subprocess.run(
+            ["node", str(cdp_script), "nav", target, "https://www.kimi.com/code/console"],
+            capture_output=True, text=True, timeout=15
+        )
+        if refresh_result.returncode != 0:
+            console.print(f"[yellow]页面刷新失败: {refresh_result.stderr}[/yellow]")
+            # 继续尝试获取，可能页面已经加载
 
-        # 2. 获取页面文本
+        # 等待页面完全加载
+        time.sleep(2)
+
+        # 3. 获取页面文本
         result = subprocess.run(
             ["node", str(cdp_script), "eval", target, "document.body.innerText"],
-            capture_output=True, text=True, timeout=15
+            capture_output=True, text=True, timeout=8
         )
 
         if result.returncode != 0:
@@ -562,10 +608,9 @@ def _get_usage_from_page() -> dict | None:
         else:
             console.print("[yellow]未找到 weekly_pct 数据[/yellow]")
 
-    except Exception as e:
-        import traceback
-        console.print(f"[yellow]CDP获取失败: {e}[/yellow]")
-        console.print(f"[dim]{traceback.format_exc()}[/dim]")
+    except Exception:
+        # CDP失败是正常的（Chrome未运行或未启用远程调试），静默回退到API
+        pass
 
     return None
 
